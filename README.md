@@ -51,6 +51,12 @@
   - 拆分原子完成：**原片段 ID 保留给左段且修订号 +1，右段获新 ID**（修订号从 1 开始）；两段原文及译文均转**待审**；
   - 既有质检放行随片段时间/文本变化**失效**（历史理由保留可查），质检规则按新时长重新计算；历史发布版本及其 SRT 不变，草稿、发布门禁与导出反映拆分结果；
   - 提交须携带所见原文修订号 `revision`（该片段已有译文时还须携带译文修订号 `translation_revision`），过期返回 `409` 与当前状态且零写入；非法切点、空文本或译文缺失同样零写入。
+- **相邻片段合并（时间端点相接的两段合为一段；预览 → 确认，另支持一步直接合并）**：校对员把同一草稿中**时间端点严格相接**（较早段终点 = 较晚段起点）且**说话人归属相同**的两段合并：
+  - 请求携带两段 ID、各自所见**原文修订号**与**合并后非空原文**；启用译文轨道时还须提交**合并后非空译文**，并对两段分别提交**当前译文修订号**（正整数）或**显式以 `null` 标识该段缺失**——不得直接沿用任一旧译文（trim 后与任一旧译文相同即拒绝）；
+  - 成功后**保留较早片段的 ID、起点与说话人归属**，终点取较晚片段，**移除较晚片段**；保留段**修订号 +1**，合并后原文与译文均转**待审**（较早段原有译文行更新、修订号 +1；无则新建，修订号从 1 开始）；
+  - 两段既有质检放行全部**失效**（较晚片段的放行行先迁到保留片段再吊销，历史理由仍可在质检报告中查询），质检按合并后的新时长重算；
+  - **草稿列表、发布门禁与草稿 SRT 立即反映合并**；历史发布版本及其原文/译文 SRT 导出**完全不变**；
+  - **非相接、ID 重复/缺失、跨视频、文本无效、任一原文或译文修订号过期时整次零写入**；修订冲突返回 `409` 与两段当前原文/译文状态；工作台可选择相邻片段先查看拟合并结果再确认。
 - **质检（QC）阈值、逐段报告与单项放行**：
   - 每个视频可分别为**原文**与**已启用译文**轨道配置 `最大每秒字符数（CPS）` 与 `最大单行字符数` 两个阈值；阈值必须为正数（单行字符数为正整数，CPS 可为小数），留空/`null` 表示该项不检查；
   - **按 Unicode 码点计数**（emoji 等代理对算 1 个字符）；**换行不计入速度**，速度 = 非换行字符数 ÷ 片段时长（秒，`(end_ms-start_ms)/1000`）；单行字符数按换行切分后取最长行；
@@ -179,6 +185,9 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
    需要整体校准时间时，勾选若干片段（表头复选框可全选）后点「⇄ 整体平移…」：
    填写非零整数毫秒偏移（正数延后、负数提前）并「预览平移」，逐段核对调整前后时间、越界与未选片段冲突，
    确认无误后「确认一次性应用」；所选片段相对间距不变、修订号逐段 +1 并撤销原文审校，其译文会标记「已失效」需重新校对。
+   需要把同一人连续的两段相接字幕并为一段时，点片段操作列的「合并…」：弹窗自动选中与该段端点相接的相邻片段，
+   可下拉改选任意两段，先查看拟合并结果（保留段、终点、说话人与两段原文/译文）；仅当两段端点相接且归属相同时可确认，
+   填写合并后非空原文（启用译文轨道时还须按合并原文重新填写非空译文，不能沿用旧译文），确认后保留较早段 ID/起点/归属、移除较晚段。
 5. 需要套用现成字幕时，点片段列表右上角「⬆ 导入 SRT…」：选择本地 `.srt` 后「解析并预览」，
    核对每条的 SRT 序号、原文件行号、时间与多行文本，以及与当前草稿的冲突；
    无冲突可「追加到草稿」，或随时「替换整个草稿」（已发布版本不受影响）。
@@ -201,9 +210,10 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 
 ## HTTP API 摘要
 
-所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认、多片段整体平移确认改持预览令牌 `token`；
+所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认、多片段整体平移确认与相邻片段合并确认改持预览令牌 `token`；
 译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`；片段拆分在已有译文时还须携带
-所见译文修订号 `translation_revision`）。
+所见译文修订号 `translation_revision`；**片段合并分别携带两段所见原文修订号 `first_revision`/`second_revision`，启用译文轨道时
+还须对两段分别提交当前译文修订号（正整数）或显式 `null` 标识缺失：`first_translation_revision`/`second_translation_revision`**）。
 质检规则修改携带所见规则修订号 `rules_revision`（首次配置传 `0`）；质检放行携带 `segment_revision`，
 译文放行还需译文 `revision`；**说话人名单增删改携带所见名单修订号 `list_revision`（首次传 `0`），片段归属修改携带
 所见片段修订号 `revision`**；过期一律 `409 revision_conflict` 并返回当前状态。
@@ -217,6 +227,9 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `POST` | `/api/videos/:id/segments` | 新增片段 `{start_ms,end_ms,text}` |
 | `PUT` | `/api/videos/:id/segments/:sid` | 修改 `{start_ms,end_ms,text,revision}` |
 | `POST` | `/api/videos/:id/segments/:sid/split` | 拆分片段 `{cut_ms,left_text,right_text,revision[,left_translation,right_translation,translation_revision]}`，原子拆为左右两段 |
+| `POST` | `/api/videos/:id/segments/merge/preview` | 预览相邻片段合并 `{first_segment_id,second_segment_id}`，返回两段当前状态、拟合并结果、`issues`/`blocked` 与确认令牌 `token` |
+| `POST` | `/api/videos/:id/segments/merge/confirm` | 确认合并 `{first_segment_id,second_segment_id,first_revision,second_revision,text,token[,translation,first_translation_revision,second_translation_revision]}`，原子合为一段 |
+| `POST` | `/api/videos/:id/segments/merge` | 一步直接合并（无需预览令牌），请求体字段同 `merge/confirm` 但省略 `token` |
 | `DELETE` | `/api/videos/:id/segments/:sid` | 删除（JSON 体带 `revision`） |
 | `POST` | `/api/videos/:id/segments/:sid/review` | 审校切换 `{reviewed,revision}` |
 | `GET` | `/api/videos/:id/speakers` | 说话人名单（含每个说话人 `usage_count`）与未归属片段 `unassigned_segment_ids`、`list_revision` |
@@ -495,6 +508,101 @@ curl -s -X POST http://localhost:8080/api/videos/$V/segments/7/split \
 | `422 missing_translation` | 已启用译文轨道但缺少左/右译文，或译文为空白 |
 | `422 copied_translation` | 左/右译文与原译文完全相同，须按拆分后的原文重新翻译 |
 | `422 invalid_timeline` | 拆分后时间线不合法（防御性复算），未写入 |
+
+### 相邻片段合并调用示例（两步：预览 → 确认；也可一步直接合并）
+
+把同一草稿中**时间端点严格相接**（较早段终点 = 较晚段起点）且**说话人归属相同**的两段合为一段。两段 ID 的提交顺序无关，
+服务端按时间先后确定保留段与移除段；服务端用 HMAC 令牌把「两段 ID 集合 + 草稿指纹」绑定到确认请求；令牌随服务进程重启失效。
+
+第一步——预览（不写入）。即使两段当前不能合并（非相接/归属不同），预览也返回 `200`，并在 `issues`/`blocked` 中逐条说明：
+
+```bash
+V=12
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/merge/preview \
+  -H 'Content-Type: application/json' -d '{"first_segment_id":7,"second_segment_id":9}'
+```
+
+成功返回（节选）：
+
+```json
+{
+  "first_segment_id": 7,
+  "second_segment_id": 9,
+  "first":  { "segment": { "id": 7, "start_ms": 1000, "end_ms": 2000, "text": "你好", "revision": 3, "speaker_id": 1 }, "translation": null },
+  "second": { "segment": { "id": 9, "start_ms": 2000, "end_ms": 3000, "text": "世界", "revision": 2, "speaker_id": 1 }, "translation": null },
+  "earlier_id": 7,
+  "later_id": 9,
+  "kept_segment_id": 7,
+  "removed_segment_id": 9,
+  "translation_lang": null,
+  "proposed": { "start_ms": 1000, "end_ms": 3000, "speaker_id": 1 },
+  "issues": [],
+  "blocked": false,
+  "token": "eyJ2IjoxMiwibSI6Im1lcmdlIiwi…….签名"
+}
+```
+
+第二步——确认（两段 ID + 各自所见原文修订号 + 合并后非空原文 + 预览 `token`；ID 顺序可与预览相反）：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/merge/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"first_segment_id":7,"second_segment_id":9,"first_revision":3,"second_revision":2,
+       "text":"你好世界","token":"eyJ2IjoxMiwibSI6Im1lcmdlIiwi…….签名"}'
+```
+
+成功返回 `201`：保留较早段 ID（#7，修订号 +1=4、起点/说话人不变、终点取较晚段）、移除较晚段（#9），合并段原文转待审；
+`segments` 为合并后的完整草稿列表（启用译文轨道时另返回 `translations`）：
+
+```json
+{
+  "ok": true,
+  "kept_segment_id": 7,
+  "removed_segment_id": 9,
+  "merged": { "id": 7, "start_ms": 1000, "end_ms": 3000, "text": "你好世界", "reviewed": false, "revision": 4, "speaker_id": 1 },
+  "segments": [ /* 合并后的完整草稿片段列表 */ ],
+  "translations": []
+}
+```
+
+也可以**一步直接合并**（不经预览、无令牌），请求体与确认相同但省略 `token`：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"first_segment_id":7,"second_segment_id":9,"first_revision":3,"second_revision":2,"text":"你好世界"}'
+```
+
+启用译文轨道时，须额外提交**合并后非空译文** `translation`，并对两段分别声明当前译文修订号：有译文给正整数，
+无译文显式给 `null`。合并后译文不得直接沿用任一旧译文（去首尾空白后与任一旧译文相同即拒绝）；
+较早段原译文行被更新（修订号 +1、转待审、重新绑定合并后原文），较早段无译文则新建（修订号从 1 开始），较晚段译文随片段移除：
+
+```bash
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/merge/confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"first_segment_id":7,"second_segment_id":9,"first_revision":3,"second_revision":2,
+       "text":"你好世界","translation":"Hello world","token":"…",
+       "first_translation_revision":2,"second_translation_revision":null}'
+```
+
+失败约定（均零写入，草稿保持原样）：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 invalid_segment_id` | 片段 ID 缺失或不是正整数 |
+| `422 duplicate_segment` | 两个片段 ID 相同 |
+| `422 unknown_segments` | 片段不存在（`error.missing_ids` 指出） |
+| `422 cross_video` | 片段不属于当前视频（`error.cross_video_ids` 指出），跨视频不能合并 |
+| `422 segments_not_adjacent` | 两段时间端点不相接（较早段终点 ≠ 较晚段起点） |
+| `422 speaker_mismatch` | 两段说话人归属不同（均未归属视为相同） |
+| `422 empty_text` | 缺少合并后原文或去首尾空白后为空 |
+| `422 missing_translation` | 启用译文轨道但缺少合并译文/译文空白 |
+| `422 copied_translation` | 合并后译文与任一旧译文完全相同，须按合并后原文重新翻译 |
+| `422 missing_revision` | 缺少原文修订号；或启用译文轨道时缺少某段的 `*_translation_revision` 声明 |
+| `422 merge_pair_changed` | 确认的两段与预览不一致，需重新预览 |
+| `409 revision_conflict` | 任一原文/译文修订号过期，或译文缺失声明与实际不符；`error.current.first`/`error.current.second` 为两段当前状态 |
+| `409 preview_required` | 缺失/伪造/过期（服务重启）的合并预览令牌，需先预览 |
+| `409 draft_changed` | 预览后草稿被修改；响应附 `current_segments`，必须重新预览后再确认 |
 
 ### 译文轨道调用示例
 

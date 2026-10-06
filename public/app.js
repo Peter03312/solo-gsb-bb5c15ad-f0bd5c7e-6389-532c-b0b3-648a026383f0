@@ -238,6 +238,7 @@ function anyModalOpen() {
          !$('importModal').classList.contains('hidden') ||
          !$('restoreModal').classList.contains('hidden') ||
          !$('shiftModal').classList.contains('hidden') ||
+         !$('mergeModal').classList.contains('hidden') ||
          !$('trModal').classList.contains('hidden') ||
          !$('qcWaiverModal').classList.contains('hidden') ||
          !$('qcPubModal').classList.contains('hidden');
@@ -494,6 +495,7 @@ function renderSegmentTable() {
         <button class="btn small" data-act="seek">定位</button>
         <button class="btn small" data-act="edit">编辑</button>
         <button class="btn small" data-act="split">拆分</button>
+        <button class="btn small" data-act="merge" title="与时间端点相接、同说话人的相邻片段合并">合并…</button>
         <button class="btn small ${s.reviewed ? 'ghost' : 'ok'}" data-act="review">${s.reviewed ? '取消审校' : '标记已审'}</button>
         ${trActions}
         <button class="btn small danger" data-act="del">删除</button>
@@ -518,6 +520,8 @@ function renderSegmentTable() {
     });
     tr.querySelector('[data-act=edit]').addEventListener('click', () => openEditor('edit', seg));
     tr.querySelector('[data-act=split]').addEventListener('click', () => openSplitModal(seg));
+    const mergeBtn = tr.querySelector('[data-act=merge]');
+    if (mergeBtn) mergeBtn.addEventListener('click', () => openMergeModal(seg));
     tr.querySelector('[data-act=review]').addEventListener('click', () => toggleReview(seg));
     tr.querySelector('[data-act=del]').addEventListener('click', () => deleteSegment(seg));
     const trEditBtn = tr.querySelector('[data-act=tr-edit]');
@@ -897,6 +901,168 @@ async function saveSplit() {
     }
     // 422 等非法修改：保留弹窗与用户输入（原稿未被服务端改动）
     $('splitError').textContent = `未拆分：${err.message}`;
+  }
+}
+
+/* ================= 相邻片段合并弹窗 ================= */
+// 预览令牌与两段（按提交顺序）的当前快照；blocked 时不可确认
+const mergeState = { firstId: null, secondId: null, preview: null };
+
+// 查找与给定片段时间端点相接的邻居（优先终点相接的后一段，其次起点相接的前一段）
+function adjacentPartner(seg) {
+  const next = state.segments.find((s) => s.id !== seg.id && s.start_ms === seg.end_ms);
+  if (next) return next;
+  return state.segments.find((s) => s.id !== seg.id && s.end_ms === seg.start_ms) || null;
+}
+
+function segOption(s) {
+  return `<option value="${s.id}">#${s.id}｜${fmtTime(s.start_ms)} → ${fmtTime(s.end_ms)}｜${esc(s.text).slice(0, 20) || '(空文本)'}</option>`;
+}
+
+function openMergeModal(seg) {
+  if (!state.segments.length) return;
+  const partner = seg ? adjacentPartner(seg) : null;
+  mergeState.firstId = seg ? seg.id : state.segments[0].id;
+  mergeState.secondId = partner
+    ? partner.id
+    : state.segments.find((s) => s.id !== mergeState.firstId).id;
+  mergeState.preview = null;
+  fillMergeSelects();
+  $('mergeFirst').value = String(mergeState.firstId);
+  $('mergeSecond').value = String(mergeState.secondId);
+  $('mergeText').value = '';
+  delete $('mergeText').dataset.touched;
+  $('mergeTr').value = '';
+  $('mergeError').textContent = '';
+  $('mergePairError').textContent = '';
+  $('mergeTrInputs').classList.toggle('hidden', !state.translationLang);
+  if (state.translationLang) $('mergeTrLang').textContent = state.translationLang;
+  $('mergeModal').classList.remove('hidden');
+  refreshMergePreview();
+}
+
+function closeMergeModal() {
+  mergeState.firstId = null;
+  mergeState.secondId = null;
+  mergeState.preview = null;
+  $('mergeModal').classList.add('hidden');
+}
+
+function fillMergeSelects() {
+  const opts = state.segments.map(segOption).join('');
+  $('mergeFirst').innerHTML = opts;
+  $('mergeSecond').innerHTML = opts;
+}
+
+// 渲染两段当前内容（原文 + 译文）与问题清单；默认合并原文为两段以换行相连
+function renderMergePreview(data) {
+  mergeState.preview = data;
+  for (const key of ['first', 'second']) {
+    const box = data[key];
+    const s = box.segment;
+    const cap = key === 'first' ? 'First' : 'Second';
+    $(`merge${cap}Meta`).textContent =
+      `#${s.id} ｜ ${fmtTime(s.start_ms)} → ${fmtTime(s.end_ms)} ｜ 修订号 ${s.revision} ｜ `
+      + `${s.speaker_name ? '说话人 ' + s.speaker_name : '未归属'} ｜ ${s.reviewed ? '已审' : '待审'}`;
+    $(`merge${cap}Text`).textContent = s.text || '(空文本)';
+    const trEl = $(`merge${cap}Tr`);
+    if (state.translationLang) {
+      trEl.classList.remove('hidden');
+      trEl.textContent = box.translation
+        ? `【译文 ${state.translationLang} rev ${box.translation.revision}】${box.translation.text || '(空)'}`
+        : '【译文：缺失】';
+    } else {
+      trEl.classList.add('hidden');
+    }
+  }
+  const issueBox = $('mergeIssueBox');
+  if (data.issues.length) {
+    issueBox.classList.remove('hidden');
+    $('mergeIssueList').innerHTML = data.issues.map((i) => `<li>${esc(i.message)}</li>`).join('');
+  } else {
+    issueBox.classList.add('hidden');
+  }
+  const speakerName = state.speakers.find((sp) => sp.id === data.proposed.speaker_id);
+  $('mergeProposed').textContent =
+    `合并结果：保留 #${data.kept_segment_id}（起点 ${fmtTime(data.proposed.start_ms)}、`
+    + `${speakerName ? '说话人 ' + esc(speakerName.name) : '未归属'}），终点 ${fmtTime(data.proposed.end_ms)}，`
+    + `移除 #${data.removed_segment_id}；修订号 +1，原文/译文转待审。`;
+  $('mergeSave').disabled = data.blocked;
+  // 用户尚未自行编辑时，用较早段+较晚段原文换行相连作为默认合并原文
+  if (!$('mergeText').dataset.touched) {
+    const earlierText = data.earlier_id === data.first.segment.id ? data.first.segment.text : data.second.segment.text;
+    const laterText = data.later_id === data.second.segment.id ? data.second.segment.text : data.first.segment.text;
+    $('mergeText').value = `${earlierText}\n${laterText}`;
+  }
+}
+
+async function refreshMergePreview() {
+  const firstId = Number($('mergeFirst').value);
+  const secondId = Number($('mergeSecond').value);
+  mergeState.firstId = firstId;
+  mergeState.secondId = secondId;
+  $('mergePairError').textContent = '';
+  $('mergeSave').disabled = true;
+  if (firstId === secondId) {
+    mergeState.preview = null;
+    $('mergePairError').textContent = '请选择两个互不相同的片段。';
+    return;
+  }
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/merge/preview`, {
+      method: 'POST',
+      body: { first_segment_id: firstId, second_segment_id: secondId },
+    });
+    renderMergePreview(data);
+  } catch (err) {
+    mergeState.preview = null;
+    $('mergePairError').textContent = `无法预览：${err.message}`;
+  }
+}
+
+async function confirmMerge() {
+  const p = mergeState.preview;
+  if (!p || p.blocked) return;
+  const body = {
+    first_segment_id: p.first_segment_id,
+    second_segment_id: p.second_segment_id,
+    first_revision: p.first.segment.revision,
+    second_revision: p.second.segment.revision,
+    text: $('mergeText').value,
+    token: p.token,
+  };
+  if (state.translationLang) {
+    body.translation = $('mergeTr').value;
+    body.first_translation_revision = p.first.translation ? p.first.translation.revision : null;
+    body.second_translation_revision = p.second.translation ? p.second.translation.revision : null;
+  }
+  $('mergeError').textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/merge/confirm`, { method: 'POST', body });
+    state.segments = data.segments;
+    state.translations = data.translations || [];
+    closeMergeModal();
+    renderSegmentDependent();
+    loadQcReport().then(() => { renderQcPanel(); renderPublishCard(); }).catch(() => {});
+    toast(`已合并为 #${data.kept_segment_id}（移除 #${data.removed_segment_id}），合并段待审`);
+  } catch (err) {
+    if (err.status === 409) {
+      // 草稿/修订变化：刷新为当前状态并重新预览，保留用户已输入的合并原文/译文
+      await refreshCurrent();
+      if (!state.segments.some((s) => s.id === mergeState.firstId) ||
+          !state.segments.some((s) => s.id === mergeState.secondId)) {
+        closeMergeModal();
+        toast('冲突：其中一段已被他人删除', true);
+        return;
+      }
+      fillMergeSelects();
+      $('mergeFirst').value = String(mergeState.firstId);
+      $('mergeSecond').value = String(mergeState.secondId);
+      await refreshMergePreview();
+      $('mergeError').textContent = `未合并：${err.message}`;
+      return;
+    }
+    $('mergeError').textContent = `未合并：${err.message}`;
   }
 }
 
@@ -1931,6 +2097,18 @@ $('splitCancel').addEventListener('click', closeSplitModal);
 $('splitSave').addEventListener('click', saveSplit);
 $('splitCutNow').addEventListener('click', () => { $('splitCut').value = currentMs(); });
 $('splitModal').addEventListener('click', (e) => { if (e.target === $('splitModal')) closeSplitModal(); });
+$('mergeCancel').addEventListener('click', closeMergeModal);
+$('mergeSave').addEventListener('click', confirmMerge);
+$('mergeSwapBtn').addEventListener('click', () => {
+  const a = $('mergeFirst').value;
+  $('mergeFirst').value = $('mergeSecond').value;
+  $('mergeSecond').value = a;
+  refreshMergePreview();
+});
+$('mergeFirst').addEventListener('change', refreshMergePreview);
+$('mergeSecond').addEventListener('change', refreshMergePreview);
+$('mergeText').addEventListener('input', () => { $('mergeText').dataset.touched = '1'; });
+$('mergeModal').addEventListener('click', (e) => { if (e.target === $('mergeModal')) closeMergeModal(); });
 $('importCancel').addEventListener('click', closeImportModal);
 $('importPreviewBtn').addEventListener('click', previewImport);
 $('importAppendBtn').addEventListener('click', () => confirmImport('append'));

@@ -222,6 +222,7 @@ async function main() {
   await translationTests();
   await shiftTests();
   await splitTests();
+  await mergeTests();
   await speakerRosterTests();
   await speakerAssignTests();
   await speakerPublishTests();
@@ -1627,6 +1628,297 @@ async function splitTests() {
   r = await req('POST', `/videos/${qp.id}/publish`, {});
   check('未放行违规阻止发布 -> 422 qc_blocked', r.status === 422 && r.json.error.code === 'qc_blocked',
     JSON.stringify(r.json));
+}
+
+async function mergeTests() {
+  console.log('44. 相邻片段合并：参数校验、非相接/重复/缺失/跨视频与零写入');
+  const mv = await uploadVideo('合并视频', 10000, 48);
+  const add = async (s, e, t) =>
+    (await req('POST', `/videos/${mv.id}/segments`, { start_ms: s, end_ms: e, text: t })).json.segment;
+  const getSegs = async () => (await req('GET', `/videos/${mv.id}`)).json.segments;
+
+  const A = await add(1000, 2000, '你好');
+  const B = await add(2000, 3000, '世界');
+
+  const mergeBody = (x, y, rx, ry, text, extra) =>
+    ({ first_segment_id: x, second_segment_id: y, first_revision: rx, second_revision: ry, text, ...(extra || {}) });
+
+  let r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(A.id, -1, 1, 1, 'x'));
+  check('非正整数 ID -> 422 invalid_segment_id', r.status === 422 && r.json.error.code === 'invalid_segment_id');
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(A.id, A.id, 1, 1, 'x'));
+  check('两段 ID 相同 -> 422 duplicate_segment', r.status === 422 && r.json.error.code === 'duplicate_segment');
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(A.id, 999999, 1, 1, 'x'));
+  check('片段缺失 -> 422 unknown_segments', r.status === 422 && r.json.error.code === 'unknown_segments' &&
+    r.json.error.missing_ids.includes(999999), JSON.stringify(r.json));
+  r = await req('POST', `/videos/${mv.id}/segments/merge`,
+    { first_segment_id: A.id, second_segment_id: B.id, first_revision: 1, second_revision: 1 });
+  check('缺合并原文 -> 422 empty_text', r.status === 422 && r.json.error.code === 'empty_text');
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(A.id, B.id, 1, 1, '   '));
+  check('合并原文仅空白 -> 422 empty_text', r.status === 422 && r.json.error.code === 'empty_text');
+  r = await req('POST', `/videos/${mv.id}/segments/merge`,
+    { first_segment_id: A.id, second_segment_id: B.id, second_revision: 1, text: 'x' });
+  check('缺原文修订号 -> 422 missing_revision', r.status === 422 && r.json.error.code === 'missing_revision');
+  eq('参数类失败零写入', (await getSegs()).map((x) => [x.id, x.start_ms, x.end_ms, x.text, x.revision]),
+    [[A.id, 1000, 2000, '你好', 1], [B.id, 2000, 3000, '世界', 1]]);
+
+  // 非相接（有间隙）：另建两段
+  const G1 = await add(4000, 4500, '甲');
+  const G2 = await add(5000, 5500, '乙');
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(G1.id, G2.id, 1, 1, '甲乙'));
+  check('端点不相接（有间隙）-> 422 segments_not_adjacent',
+    r.status === 422 && r.json.error.code === 'segments_not_adjacent', JSON.stringify(r.json));
+
+  // 跨视频：另一视频的片段
+  const other = await uploadVideo('合并他视频', 10000, 48);
+  const X = (await req('POST', `/videos/${other.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '他' })).json.segment;
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(A.id, X.id, 1, 1, 'x'));
+  check('跨视频合并 -> 422 cross_video', r.status === 422 && r.json.error.code === 'cross_video' &&
+    r.json.error.cross_video_ids.includes(X.id), JSON.stringify(r.json));
+  eq('非相接/跨视频零写入', (await getSegs()).length, 4);
+
+  // 说话人归属不同 -> 拒绝
+  const S1 = (await req('POST', `/videos/${mv.id}/speakers`, { name: '主持', list_revision: 0 })).json.speaker.id;
+  await req('PUT', `/videos/${mv.id}/segments/${A.id}/speaker`, { speaker_id: S1, revision: 1 });
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(A.id, B.id, 2, 1, '你好世界'));
+  check('归属不同 -> 422 speaker_mismatch', r.status === 422 && r.json.error.code === 'speaker_mismatch');
+  // 同归属（都归属到 S1）后可以合并；提交顺序与时间先后相反也能识别
+  await req('PUT', `/videos/${mv.id}/segments/${B.id}/speaker`, { speaker_id: S1, revision: 1 });
+  r = await req('POST', `/videos/${mv.id}/segments/merge`,
+    { first_segment_id: B.id, second_segment_id: A.id, first_revision: 2, second_revision: 2, text: '你好世界' });
+  check('同属一名说话人且提交顺序相反 -> 合并成功', r.status === 201, JSON.stringify(r.json));
+
+  console.log('45. 相邻片段合并：成功语义（保留早段 ID/起点/归属，修订号+1，两段待审）');
+  eq('保留较早片段 ID/起点，终点取较晚片段，归属保留',
+    [r.json.kept_segment_id, r.json.removed_segment_id, r.json.merged.id,
+      r.json.merged.start_ms, r.json.merged.end_ms, r.json.merged.text,
+      r.json.merged.speaker_id, r.json.merged.revision, r.json.merged.reviewed],
+    [A.id, B.id, A.id, 1000, 3000, '你好世界', S1, 3, false]);
+  let segs = await getSegs();
+  check('较晚片段已移除', !segs.some((x) => x.id === B.id));
+  eq('草稿列表立即反映合并（时间排序）', segs.map((x) => [x.id, x.start_ms, x.end_ms, x.text]),
+    [[A.id, 1000, 3000, '你好世界'], [G1.id, 4000, 4500, '甲'], [G2.id, 5000, 5500, '乙']]);
+  eq('其他片段修订号/内容不受影响', [segs.find((x) => x.id === G1.id).revision, segs.find((x) => x.id === G2.id).revision], [1, 1]);
+
+  // 两个均未归属（speaker_id 同为 null）的相接片段也允许合并
+  const H1 = await add(6000, 7000, '无主甲');
+  const H2 = await add(7000, 8000, '无主乙');
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(H1.id, H2.id, 1, 1, '无主合体'));
+  check('两段均未归属（null==null）允许合并', r.status === 201 && r.json.merged.speaker_id === null);
+
+  console.log('46. 相邻片段合并：修订号过期 -> 409 返回两段当前状态且零写入');
+  const K1 = await add(8000, 8500, '冲突甲');
+  const K2 = await add(8500, 9000, '冲突乙');
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(K1.id, K2.id, 7, 1, '合体'));
+  check('早段原文修订号过期 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict');
+  check('409 按提交顺序返回两段当前状态',
+    r.json.error.current.first.segment.id === K1.id && r.json.error.current.second.segment.id === K2.id &&
+    r.json.error.current.first.segment.revision === 1 && r.json.error.current.second.segment.revision === 1,
+    JSON.stringify(r.json.error.current));
+  r = await req('POST', `/videos/${mv.id}/segments/merge`, mergeBody(K1.id, K2.id, 1, 8, '合体'));
+  check('晚段原文修订号过期 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict');
+  eq('冲突零写入（两段仍在）', (await getSegs()).filter((x) => [K1.id, K2.id].includes(x.id)).map((x) => x.text),
+    ['冲突甲', '冲突乙']);
+
+  console.log('47. 相邻片段合并：预览（blocked/令牌）与确认（草稿变化/非法令牌）');
+  let p = await req('POST', `/videos/${mv.id}/segments/merge/preview`,
+    { first_segment_id: K1.id, second_segment_id: K2.id });
+  check('相接且同归属预览 200、不 blocked', p.status === 200 && p.json.blocked === false, JSON.stringify(p.json));
+  eq('预览识别较早/较晚与保留/移除',
+    [p.json.earlier_id, p.json.later_id, p.json.kept_segment_id, p.json.removed_segment_id,
+      p.json.proposed.start_ms, p.json.proposed.end_ms],
+    [K1.id, K2.id, K1.id, K2.id, 8000, 9000]);
+  check('预览返回令牌', typeof p.json.token === 'string' && p.json.token.includes('.'));
+  p = await req('POST', `/videos/${mv.id}/segments/merge/preview`,
+    { first_segment_id: G1.id, second_segment_id: G2.id });
+  check('非相接预览 200 但 blocked 且指出原因',
+    p.status === 200 && p.json.blocked === true &&
+    p.json.issues.some((i) => i.code === 'segments_not_adjacent'), JSON.stringify(p.json));
+  r = await req('POST', `/videos/${mv.id}/segments/merge/confirm`,
+    mergeBody(K1.id, K2.id, 1, 1, '合体', { token: 'garbage.token' }));
+  check('坏令牌确认 -> 409 preview_required', r.status === 409 && r.json.error.code === 'preview_required');
+  const goodToken = (await req('POST', `/videos/${mv.id}/segments/merge/preview`,
+    { first_segment_id: K1.id, second_segment_id: K2.id })).json.token;
+  // 预览后他人改动草稿（审校也算）
+  await req('POST', `/videos/${mv.id}/segments/${K1.id}/review`, { reviewed: true, revision: 1 });
+  r = await req('POST', `/videos/${mv.id}/segments/merge/confirm`,
+    { first_segment_id: K1.id, second_segment_id: K2.id, first_revision: 1, second_revision: 1,
+      text: '合体', token: goodToken });
+  check('预览后草稿变化 -> 409 draft_changed', r.status === 409 && r.json.error.code === 'draft_changed');
+  check('冲突返回当前草稿', Array.isArray(r.json.error.current_segments));
+  // 取消审校后用新令牌确认成功
+  await req('POST', `/videos/${mv.id}/segments/${K1.id}/review`, { reviewed: true, revision: 2 });
+  await req('POST', `/videos/${mv.id}/segments/${K1.id}/review`, { reviewed: false, revision: 3 });
+  const token2 = (await req('POST', `/videos/${mv.id}/segments/merge/preview`,
+    { first_segment_id: K1.id, second_segment_id: K2.id })).json.token;
+  r = await req('POST', `/videos/${mv.id}/segments/merge/confirm`,
+    { first_segment_id: K2.id, second_segment_id: K1.id, first_revision: 1, second_revision: 4,
+      text: '合体', token: token2 });
+  check('新令牌、顺序相反确认成功', r.status === 201, JSON.stringify(r.json));
+  eq('确认后保留较早 ID', r.json.merged.id, K1.id);
+
+  console.log('48. 合并与发布门禁、草稿 SRT、历史版本不可变');
+  // 先在一个干净视频上发布 v1，再合并草稿，验证历史不变
+  const pv = await uploadVideo('合并发布', 10000, 48);
+  const P1 = (await req('POST', `/videos/${pv.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '甲原' })).json.segment;
+  const P2 = (await req('POST', `/videos/${pv.id}/segments`, { start_ms: 2000, end_ms: 3000, text: '乙原' })).json.segment;
+  await req('POST', `/videos/${pv.id}/segments/${P1.id}/review`, { reviewed: true, revision: 1 });
+  await req('POST', `/videos/${pv.id}/segments/${P2.id}/review`, { reviewed: true, revision: 1 });
+  r = await req('POST', `/videos/${pv.id}/publish`, {});
+  check('合并前发布 v1', r.status === 201 && r.json.publication.version === 1);
+  const v1Srt = await (await fetch(`${BASE}/videos/${pv.id}/srt?version=1`)).text();
+  // 两段均已审（修订号已因审校变为 2）
+  r = await req('POST', `/videos/${pv.id}/segments/merge`, mergeBody(P1.id, P2.id, 2, 2, '甲乙合体'));
+  check('合并草稿成功', r.status === 201, JSON.stringify(r.json));
+  const st = (await req('GET', `/videos/${pv.id}/status`)).json;
+  check('合并后待审阻止发布', st.canPublish === false &&
+    st.pending.some((x) => x.segment_id === P1.id && x.reasons.includes('segment_unreviewed')), JSON.stringify(st.pending));
+  let srt = await (await fetch(`${BASE}/videos/${pv.id}/srt?version=draft`)).text();
+  check('草稿 SRT 反映合并（单段、跨 1–3s）',
+    /00:00:01,000 --> 00:00:03,000/.test(srt) && /甲乙合体/.test(srt), srt);
+  const v1SrtAfter = await (await fetch(`${BASE}/videos/${pv.id}/srt?version=1`)).text();
+  eq('历史发布 v1 的 SRT 不变', v1SrtAfter, v1Srt);
+  const pubs = (await req('GET', `/videos/${pv.id}/publications`)).json.publications;
+  eq('历史发布版本仍在', pubs.map((x) => x.version), [1]);
+  // 审校合并段（合并使修订号 2 -> 3）后可发布 v2
+  await req('POST', `/videos/${pv.id}/segments/${P1.id}/review`, { reviewed: true, revision: 3 });
+  r = await req('POST', `/videos/${pv.id}/publish`, {});
+  check('审校合并段后可发布 v2', r.status === 201 && r.json.publication.version === 2, JSON.stringify(r.json));
+
+  console.log('49. 合并与译文轨道：合并译文、逐段修订/缺失声明、复制禁止');
+  const tv = await uploadVideo('合并译文', 10000, 48);
+  await req('PUT', `/videos/${tv.id}/translation/track`, { language: 'en' });
+  const T1 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 1000, end_ms: 2000, text: '你好' })).json.segment;
+  const T2 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 2000, end_ms: 3000, text: '世界' })).json.segment;
+  const getTd = async () => (await req('GET', `/videos/${tv.id}`)).json;
+
+  r = await req('POST', `/videos/${tv.id}/segments/merge`, mergeBody(T1.id, T2.id, 1, 1, '你好世界'));
+  check('启用轨道但缺合并译文 -> 422 missing_translation',
+    r.status === 422 && r.json.error.code === 'missing_translation');
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(T1.id, T2.id, 1, 1, '你好世界', { translation: 'Hello world' }));
+  check('缺逐段译文修订/缺失声明 -> 422 missing_revision',
+    r.status === 422 && r.json.error.code === 'missing_revision');
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(T1.id, T2.id, 1, 1, '你好世界',
+      { translation: '  ', first_translation_revision: null, second_translation_revision: null }));
+  check('合并译文空白 -> 422 missing_translation',
+    r.status === 422 && r.json.error.code === 'missing_translation');
+  // 两段均无译文：null/null 声明 + 合并译文 -> 译文新建（修订号 1、待审、绑定合并原文）
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(T1.id, T2.id, 1, 1, '你好世界',
+      { translation: 'Hello world', first_translation_revision: null, second_translation_revision: null }));
+  check('两段无译文合并成功 201', r.status === 201, JSON.stringify(r.json));
+  let t = r.json.translations.find((x) => x.segment_id === T1.id);
+  eq('合并译文新建：修订号 1、待审、未失效、绑定合并原文',
+    [t.text, t.revision, t.reviewed, t.stale, t.source_start_ms, t.source_end_ms, t.source_text],
+    ['Hello world', 1, false, false, 1000, 3000, '你好世界']);
+  eq('较晚片段译文行随片段移除（仅剩一段译文）', r.json.translations.length, 1);
+
+  // 一段有译文、一段无译文
+  const U1 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 4000, end_ms: 5000, text: '早上' })).json.segment;
+  const U2 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 5000, end_ms: 6000, text: '好' })).json.segment;
+  await req('PUT', `/videos/${tv.id}/segments/${U1.id}/translation`, { text: 'Good', segment_revision: 1 });
+  // 声明与实际不符（U1 有译文却声明 null）-> 409
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(U1.id, U2.id, 1, 1, '早上好',
+      { translation: 'Good morning', first_translation_revision: null, second_translation_revision: null }));
+  check('译文存在却声明缺失 -> 409 并返回两段状态',
+    r.status === 409 && r.json.error.code === 'revision_conflict' &&
+    r.json.error.current.first.translation.text === 'Good', JSON.stringify(r.json));
+  // 译文修订号过期 -> 409
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(U1.id, U2.id, 1, 1, '早上好',
+      { translation: 'Good morning', first_translation_revision: 9, second_translation_revision: null }));
+  check('译文修订号过期 -> 409', r.status === 409 && r.json.error.code === 'revision_conflict');
+  // 直接沿用旧译文 -> 422 copied_translation
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(U1.id, U2.id, 1, 1, '早上好',
+      { translation: 'Good', first_translation_revision: 1, second_translation_revision: null }));
+  check('合并译文沿用旧译文 -> 422 copied_translation',
+    r.status === 422 && r.json.error.code === 'copied_translation');
+  let det = await getTd();
+  eq('译文类失败零写入（两段与原译文均不变）',
+    [det.segments.length, det.translations.length,
+      det.translations.find((x) => x.segment_id === U1.id).revision],
+    [3, 2, 1]);
+  // 正确声明 + 新译文：较早译文行更新（修订号 +1、待审、重绑），较晚无译文不新建
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(U1.id, U2.id, 1, 1, '早上好',
+      { translation: 'Good morning', first_translation_revision: 1, second_translation_revision: null }));
+  check('携带正确译文声明合并成功', r.status === 201, JSON.stringify(r.json));
+  t = r.json.translations.find((x) => x.segment_id === U1.id);
+  eq('较早译文行更新：修订号 +1、待审、未失效、绑定合并原文',
+    [t.text, t.revision, t.reviewed, t.stale, t.source_start_ms, t.source_end_ms, t.source_text],
+    ['Good morning', 2, false, false, 4000, 6000, '早上好']);
+
+  // 合并后双轨门禁：合并段原文与译文均待审 -> 阻止发布；审校后可发布且历史双轨快照不变
+  det = await getTd();
+  for (const s of det.segments) {
+    await req('POST', `/videos/${tv.id}/segments/${s.id}/review`, { reviewed: true, revision: s.revision });
+  }
+  det = await getTd();
+  for (const x of det.translations) {
+    const segRev = det.segments.find((s) => s.id === x.segment_id).revision;
+    await req('POST', `/videos/${tv.id}/segments/${x.segment_id}/translation/review`,
+      { reviewed: true, segment_revision: segRev, revision: x.revision });
+  }
+  r = await req('POST', `/videos/${tv.id}/publish`, {});
+  check('双轨齐备发布 v1', r.status === 201 && r.json.publication.has_translation === true, JSON.stringify(r.json));
+  const v1TrSrt = await (await fetch(`${BASE}/videos/${tv.id}/srt/translation?version=1`)).text();
+
+  // 发布后再合并草稿（两段都有译文的情形）
+  det = await getTd();
+  const M1 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 7000, end_ms: 8000, text: '晚上' })).json.segment;
+  const M2 = (await req('POST', `/videos/${tv.id}/segments`, { start_ms: 8000, end_ms: 9000, text: '好' })).json.segment;
+  await req('PUT', `/videos/${tv.id}/segments/${M1.id}/translation`, { text: 'Good evening', segment_revision: 1 });
+  await req('PUT', `/videos/${tv.id}/segments/${M2.id}/translation`, { text: 'again', segment_revision: 1 });
+  r = await req('POST', `/videos/${tv.id}/segments/merge`,
+    mergeBody(M1.id, M2.id, 1, 1, '晚上好',
+      { translation: 'Good evening again', first_translation_revision: 1, second_translation_revision: 1 }));
+  check('两段均有译文合并成功（较早行 +1，较晚行移除）', r.status === 201, JSON.stringify(r.json));
+  eq('译文行数等于片段数（较晚译文随片段移除）', r.json.translations.length, r.json.segments.length);
+  const v1TrSrtAfter = await (await fetch(`${BASE}/videos/${tv.id}/srt/translation?version=1`)).text();
+  eq('历史发布 v1 译文 SRT 不变', v1TrSrtAfter, v1TrSrt);
+  const draftTrSrt = await (await fetch(`${BASE}/videos/${tv.id}/srt/translation?version=draft`)).text();
+  check('草稿译文 SRT 反映合并（含合并段时间戳）',
+    /00:00:07,000 --> 00:00:09,000/.test(draftTrSrt) && /Good evening again/.test(draftTrSrt), draftTrSrt);
+  const st2 = (await req('GET', `/videos/${tv.id}/status`)).json;
+  check('合并后双轨门禁阻止发布（原文+译文待审）',
+    st2.canPublish === false &&
+    st2.pending.some((x) => x.segment_id === M1.id &&
+      x.reasons.includes('segment_unreviewed') && x.reasons.includes('translation_unreviewed')),
+    JSON.stringify(st2.pending));
+
+  console.log('50. 合并与质检：两段既有放行失效、历史理由保留可查、按新时长重算');
+  const qv = await uploadVideo('合并质检', 10000, 48);
+  const Q1 = (await req('POST', `/videos/${qv.id}/segments`,
+    { start_ms: 1, end_ms: 1000, text: '一二三四五六七八九十' })).json.segment;
+  const Q2 = (await req('POST', `/videos/${qv.id}/segments`,
+    { start_ms: 1000, end_ms: 2000, text: 'abcdefghij' })).json.segment;
+  await req('PUT', `/videos/${qv.id}/qc/rules`, { source_max_cps: 5, rules_revision: 0 });
+  await req('PUT', `/videos/${qv.id}/segments/${Q1.id}/qc/waiver`,
+    { track: 'source', rule: 'max_cps', reason: 'Q1放行理由', segment_revision: 1 });
+  await req('PUT', `/videos/${qv.id}/segments/${Q2.id}/qc/waiver`,
+    { track: 'source', rule: 'max_cps', reason: 'Q2放行理由', segment_revision: 1 });
+  let qc = (await req('GET', `/videos/${qv.id}/qc`)).json;
+  eq('合并前两段违规均已放行', [qc.violation_count, qc.blocking_count, qc.active_waiver_count], [2, 0, 2]);
+  r = await req('POST', `/videos/${qv.id}/segments/merge`,
+    mergeBody(Q1.id, Q2.id, 1, 1, '一二三四五六七八九十abcdefghij'));
+  check('合并成功', r.status === 201);
+  qc = (await req('GET', `/videos/${qv.id}/qc`)).json;
+  eq('按合并后时长重算：单段 1 项违规', qc.violation_count, 1);
+  eq('合并后违规未放行', qc.blocking_count, 1);
+  eq('两段既有放行全部失效', qc.active_waiver_count, 0);
+  eq('两条历史放行都保留（含较晚片段那条，迁到保留片段）', qc.inactive_waiver_count, 2);
+  check('历史理由仍可查询（两条均在保留片段下）',
+    qc.waivers.every((w) => w.segment_id === Q1.id && !w.active && w.revoked_at != null) &&
+    qc.waivers.some((w) => w.reason === 'Q1放行理由') &&
+    qc.waivers.some((w) => w.reason === 'Q2放行理由'),
+    JSON.stringify(qc.waivers.map((w) => [w.segment_id, w.active, w.reason])));
+  // 未放行违规阻止发布
+  await req('POST', `/videos/${qv.id}/segments/${Q1.id}/review`, { reviewed: true, revision: 2 });
+  r = await req('POST', `/videos/${qv.id}/publish`, {});
+  check('未放行违规阻止发布 -> 422 qc_blocked', r.status === 422 && r.json.error.code === 'qc_blocked');
 }
 
 // 38. 说话人名单：trim、去重、名单修订号与引用保护

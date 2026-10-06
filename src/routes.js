@@ -1277,6 +1277,398 @@ router.post('/videos/:id(\\d+)/segments/:sid(\\d+)/split', (req, res, next) => {
   }
 });
 
+/* ---------------- 相邻片段合并（预览 -> 确认；另提供一步直接合并） ---------------- */
+
+// 读取并解析合并请求体的静态部分（不含库内状态）：两个互不相同的正整数片段 ID、
+// 各自所见原文修订号、合并后非空原文；启用译文轨道时还须提交合并后非空译文，
+// 并对两段分别提交当前译文修订号（正整数）或显式以 null 标识该段无译文。
+function readMergeInput(body, { track }) {
+  if (!body || typeof body !== 'object') {
+    throw new ApiError(422, 'invalid_merge', '请提交合并请求 JSON 体');
+  }
+  const readId = (key) => {
+    const n = Number(body[key]);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new ApiError(422, 'invalid_segment_id', `请提交正整数片段 ID ${key}`);
+    }
+    return n;
+  };
+  const firstId = readId('first_segment_id');
+  const secondId = readId('second_segment_id');
+  if (firstId === secondId) {
+    throw new ApiError(422, 'duplicate_segment', '合并的两个片段 ID 必须互不相同');
+  }
+  const readRev = (key) => {
+    const n = Number(body[key]);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new ApiError(422, 'missing_revision', `请携带所见原文修订号 ${key}（正整数）`);
+    }
+    return n;
+  };
+  const revisions = { [firstId]: readRev('first_revision'), [secondId]: readRev('second_revision') };
+
+  if (body.text == null) {
+    throw new ApiError(422, 'empty_text', '请提交合并后非空原文 text（去首尾空白后至少 1 个字符）');
+  }
+  const text = normalizeText(body.text);
+  if (!text.trim()) throw new ApiError(422, 'empty_text', '合并后原文不能为空（去首尾空白后至少 1 个字符）');
+
+  let mergedTranslation = null;
+  const trRevisions = {};
+  if (track) {
+    if (body.translation == null) {
+      throw new ApiError(422, 'missing_translation',
+        '已启用译文轨道：合并时须提交合并后非空译文 translation（不能丢弃译文，也不能直接沿用任一旧译文）');
+    }
+    mergedTranslation = normalizeText(body.translation);
+    if (!mergedTranslation.trim()) {
+      throw new ApiError(422, 'missing_translation', '合并后译文不能为空（去首尾空白后至少 1 个字符）');
+    }
+    // 两段都必须声明当前译文修订号：有译文 -> 正整数；无译文 -> 显式 null
+    const readTrRev = (idKey, id) => {
+      const field = `${idKey}_translation_revision`;
+      if (!(field in body)) {
+        throw new ApiError(422, 'missing_revision',
+          `已启用译文轨道：请对片段 #${id} 提交当前译文修订号 ${field}（正整数），或显式传 null 表示该段无译文`);
+      }
+      const raw = body[field];
+      if (raw === null) { trRevisions[id] = null; return; }
+      const n = Number(raw);
+      if (!Number.isInteger(n) || n < 1) {
+        throw new ApiError(422, 'missing_revision',
+          `片段 #${id} 的 ${field} 必须为正整数译文修订号，或显式传 null 表示该段无译文`);
+      }
+      trRevisions[id] = n;
+    };
+    readTrRev('first', firstId);
+    readTrRev('second', secondId);
+  }
+
+  return { firstId, secondId, revisions, text, mergedTranslation, trRevisions };
+}
+
+// 跨视频/本视频加载两段（可能不存在），按提交顺序返回
+function loadMergePair(videoId, firstId, secondId) {
+  const byIds = new Map();
+  for (const row of get()
+    .prepare(`${SEGMENT_SELECT} WHERE s.id IN (?, ?)`).all(firstId, secondId)) {
+    byIds.set(row.id, row);
+  }
+  const first = byIds.get(firstId) || null;
+  const second = byIds.get(secondId) || null;
+  const missing = [];
+  if (!first) missing.push(firstId);
+  if (!second) missing.push(secondId);
+  if (missing.length) {
+    throw new ApiError(422, 'unknown_segments', `以下片段不存在：${missing.join('、')}`, { missing_ids: missing });
+  }
+  const crossVideo = [first, second].filter((s) => s.video_id !== videoId).map((s) => s.id);
+  if (crossVideo.length) {
+    throw new ApiError(422, 'cross_video',
+      `片段必须属于当前视频 #${videoId}，以下片段属于其他视频：${crossVideo.join('、')}（跨视频不能合并）`,
+      { cross_video_ids: crossVideo });
+  }
+  return { first, second };
+}
+
+// 按时间先后排序并校验「端点相接 + 归属相同」；返回 {earlier, later} 或 issues（纯计算）
+function evaluateMergePair(first, second) {
+  const ordered = [first, second].sort((a, b) => a.start_ms - b.start_ms || a.id - b.id);
+  const [earlier, later] = ordered;
+  const issues = [];
+  if (earlier.end_ms !== later.start_ms) {
+    issues.push({
+      code: 'segments_not_adjacent',
+      earlier_id: earlier.id,
+      later_id: later.id,
+      join_at: earlier.end_ms,
+      other_start_ms: later.start_ms,
+      message: `两段时间端点不相接：较早片段 #${earlier.id} 终点为 ${earlier.end_ms}ms，`
+        + `较晚片段 #${later.id} 起点为 ${later.start_ms}ms（须严格相等才能合并；端点相接以外的关系不允许合并）`,
+    });
+  }
+  // speaker_id 同为 null（均未归属）视为归属相同
+  if (!Object.is(earlier.speaker_id, later.speaker_id)) {
+    issues.push({
+      code: 'speaker_mismatch',
+      earlier_id: earlier.id,
+      later_id: later.id,
+      earlier_speaker_id: earlier.speaker_id,
+      later_speaker_id: later.speaker_id,
+      message: `两段说话人归属不同：#${earlier.id} 归属 ${earlier.speaker_id == null ? '未归属' : '#' + earlier.speaker_id}，`
+        + `#${later.id} 归属 ${later.speaker_id == null ? '未归属' : '#' + later.speaker_id}；归属不同的片段不能合并`,
+    });
+  }
+  return { earlier, later, issues };
+}
+
+// 合并冲突的当前状态载荷：按提交顺序给出两段的当前原文与译文
+function mergeConflictCurrent(videoId, firstId, secondId) {
+  return {
+    first: conflictCurrent(videoId, firstId),
+    second: conflictCurrent(videoId, secondId),
+  };
+}
+
+// 事务内执行合并。input 已由 readMergeInput 解析；allInputValid 表示静态文本校验已通过。
+// 任何失败均抛出（事务整体回滚，零写入）。
+function applyMerge(video, input) {
+  const dbx = get();
+  return dbx.transaction(() => {
+    const locked = dbx.prepare('SELECT * FROM videos WHERE id = ?').get(video.id);
+    if (!locked) throw new ApiError(404, 'not_found', `视频 #${video.id} 不存在`);
+
+    const { firstId, secondId } = input;
+    const byIds = new Map();
+    for (const row of dbx
+      .prepare(`${SEGMENT_SELECT} WHERE s.id IN (?, ?)`).all(firstId, secondId)) {
+      byIds.set(row.id, row);
+    }
+    const first = byIds.get(firstId);
+    const second = byIds.get(secondId);
+    if (!first || !second) {
+      throw new ApiError(422, 'unknown_segments',
+        `以下片段不存在：${[!first ? firstId : null, !second ? secondId : null].filter((x) => x != null).join('、')}`,
+        { missing_ids: [!first ? firstId : null, !second ? secondId : null].filter((x) => x != null) });
+    }
+    const cross = [first, second].filter((s) => s.video_id !== video.id).map((s) => s.id);
+    if (cross.length) {
+      throw new ApiError(422, 'cross_video',
+        `片段必须属于当前视频 #${video.id}，以下片段属于其他视频：${cross.join('、')}（跨视频不能合并）`,
+        { cross_video_ids: cross });
+    }
+
+    // 原文修订号乐观锁：任一段过期 -> 409，返回两段当前状态
+    for (const s of [first, second]) {
+      if (s.revision !== input.revisions[s.id]) {
+        throw new ApiError(409, 'revision_conflict',
+          `原文修订号已过期：片段 #${s.id} 已被他人修改，已为你加载两段当前原文与译文状态，请基于当前内容重试`,
+          { current: mergeConflictCurrent(video.id, firstId, secondId) });
+      }
+    }
+
+    // 时间端点必须相接（纯计算校验，且与相邻片段无关）
+    const { earlier, later, issues } = evaluateMergePair(first, second);
+    const notAdjacent = issues.find((i) => i.code === 'segments_not_adjacent');
+    if (notAdjacent) throw new ApiError(422, 'segments_not_adjacent', notAdjacent.message, issues.length ? { issues } : {});
+
+    // 说话人归属必须相同
+    const mismatch = issues.find((i) => i.code === 'speaker_mismatch');
+    if (mismatch) throw new ApiError(422, 'speaker_mismatch', mismatch.message, { issues });
+
+    const track = !!locked.translation_lang;
+    let earlierTr = null;
+    let laterTr = null;
+    if (track) {
+      earlierTr = getTranslationRow(video.id, earlier.id);
+      laterTr = getTranslationRow(video.id, later.id);
+      // 逐段核对「所见译文修订号或明确缺失」声明；任一不符 -> 409
+      for (const [seg, tr] of [[earlier, earlierTr], [later, laterTr]]) {
+        const declared = input.trRevisions[seg.id];
+        const actual = tr ? tr.revision : null;
+        if (declared !== actual) {
+          throw new ApiError(409, 'revision_conflict',
+            (tr
+              ? `片段 #${seg.id} 的译文修订号已过期或缺失标识有误：该段当前有译文（修订号 ${tr.revision}），请携带当前译文修订号重试`
+              : `片段 #${seg.id} 当前没有译文，请显式以 null 标识其译文缺失后重试`)
+            + '；已为你加载两段当前原文与译文状态',
+            { current: mergeConflictCurrent(video.id, firstId, secondId) });
+        }
+      }
+      // 合并后译文不得直接沿用任一旧译文（trim 后完全相同即视为沿用）
+      const mergedTrim = input.mergedTranslation.trim();
+      for (const tr of [earlierTr, laterTr]) {
+        if (tr && mergedTrim === tr.text.trim()) {
+          throw new ApiError(422, 'copied_translation',
+            `合并后译文不得直接沿用旧译文：与片段 #${tr.segment_id} 的现有译文完全相同，请按合并后原文重新翻译`,
+            { current: mergeConflictCurrent(video.id, firstId, secondId) });
+        }
+      }
+    }
+
+    // 防御性复算：合并后的全量时间线必须仍合法（端点相接合并且不影响其他片段时天然成立）
+    const allRows = dbx.prepare('SELECT * FROM segments WHERE video_id = ?').all(video.id);
+    const timeline = allRows
+      .filter((row) => row.id !== later.id)
+      .map((row) => (row.id === earlier.id
+        ? { id: row.id, start_ms: earlier.start_ms, end_ms: later.end_ms }
+        : { id: row.id, start_ms: row.start_ms, end_ms: row.end_ms }));
+    const check = validateTimeline(timeline, video.duration_ms);
+    if (!check.ok) {
+      throw new ApiError(422, 'invalid_timeline', `合并后时间线不合法，未写入任何内容：${check.reason}`);
+    }
+
+    const ts = now();
+
+    // 质检放行：
+    // - 较早片段：时间与文本都变化，其全部有效放行失效（行保留为历史）；
+    // - 较晚片段：该片段将被移除，先把它的全部放行行（含历史）迁到保留片段再标记失效，
+    //   理由仍可在质检报告的 waivers 历史中查询（直接删除片段会级联抹掉历史）。
+    dbx.prepare(
+      'UPDATE qc_waivers SET segment_id = ? WHERE segment_id = ?'
+    ).run(earlier.id, later.id);
+    deactivateSegmentQcWaivers(dbx, earlier.id, ts);
+
+    // 保留较早片段：ID、起点、归属不变；终点取较晚片段；原文更新、修订号 +1、转待审
+    dbx.prepare(
+      `UPDATE segments SET end_ms = ?, text = ?, reviewed = 0, revision = revision + 1, updated_at = ?
+       WHERE id = ?`
+    ).run(later.end_ms, input.text, ts, earlier.id);
+
+    if (track) {
+      // 先显式删除较晚片段译文行（随后删除片段也会级联，这里先删保证确定性）
+      dbx.prepare('DELETE FROM translations WHERE video_id = ? AND segment_id = ?').run(video.id, later.id);
+      // 合并后译文落到较早片段：该段原有译文行则更新（修订号 +1），无则新建（修订号从 1 开始）；
+      // 无论哪种都待审并重新绑定合并后原文（不失效）
+      if (earlierTr) {
+        dbx.prepare(
+          `UPDATE translations
+           SET text = ?, reviewed = 0, revision = revision + 1,
+               source_start_ms = ?, source_end_ms = ?, source_text = ?, updated_at = ?
+           WHERE id = ?`
+        ).run(input.mergedTranslation, earlier.start_ms, later.end_ms, input.text, ts, earlierTr.id);
+      } else {
+        dbx.prepare(
+          `INSERT INTO translations (video_id, segment_id, text, reviewed, revision,
+                                     source_start_ms, source_end_ms, source_text, created_at, updated_at)
+           VALUES (?, ?, ?, 0, 1, ?, ?, ?, ?, ?)`
+        ).run(video.id, earlier.id, input.mergedTranslation,
+          earlier.start_ms, later.end_ms, input.text, ts, ts);
+      }
+    }
+
+    // 移除较晚片段（其质检放行已迁走；其译文已显式删除）
+    dbx.prepare('DELETE FROM segments WHERE id = ? AND video_id = ?').run(later.id, video.id);
+
+    return {
+      earlierId: earlier.id,
+      laterId: later.id,
+      merged: mapSegment(dbx.prepare(`${SEGMENT_SELECT} WHERE s.id = ?`).get(earlier.id)),
+    };
+  })();
+}
+
+// 构造合并预览载荷（纯读）：即使 blocked 也返回 200 与问题清单及令牌（令牌确认时仍会被拒）
+function buildMergePreview(video, input) {
+  const { first, second } = loadMergePair(video.id, input.firstId, input.secondId);
+  const { earlier, later, issues } = evaluateMergePair(first, second);
+  const blocked = issues.length > 0;
+  const segView = (s) => {
+    const row = mapSegment(s);
+    return row;
+  };
+  const trOf = (id) => {
+    if (!video.translation_lang) return null;
+    const tr = getTranslationRow(video.id, id);
+    return tr ? mapTranslationJoined(tr) : null;
+  };
+  const token = makePreviewToken({
+    videoId: video.id,
+    mode: 'merge',
+    draftHash: draftFingerprint(listSegments(video.id)),
+    extra: { a: input.firstId, b: input.secondId },
+  });
+  return {
+    first_segment_id: input.firstId,
+    second_segment_id: input.secondId,
+    first: { segment: segView(first), translation: trOf(input.firstId) },
+    second: { segment: segView(second), translation: trOf(input.secondId) },
+    earlier_id: earlier.id,
+    later_id: later.id,
+    kept_segment_id: earlier.id,
+    removed_segment_id: later.id,
+    translation_lang: video.translation_lang != null ? video.translation_lang : null,
+    proposed: {
+      start_ms: earlier.start_ms,
+      end_ms: later.end_ms,
+      speaker_id: earlier.speaker_id,
+    },
+    issues,
+    blocked,
+    token,
+  };
+}
+
+// 合并预览（不写入）：{first_segment_id, second_segment_id}
+// 仅静态校验 ID 与归属视频；非相接/归属不同返回 200 + blocked + issues（供工作台展示）。
+router.post('/videos/:id(\\d+)/segments/merge/preview', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    // 预览只需两个片段 ID；正文/修订号在确认时才提交
+    const previewInput = readMergeInput({
+      first_segment_id: req.body && req.body.first_segment_id,
+      second_segment_id: req.body && req.body.second_segment_id,
+      first_revision: 1,
+      second_revision: 1,
+      text: '预览占位文本',
+    }, { track: false });
+    res.json(buildMergePreview(video, previewInput));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 确认合并（与预览相同的两段 + 预览令牌）：{first_segment_id, second_segment_id, first_revision,
+// second_revision, text, token[, translation, first_translation_revision, second_translation_revision]}
+router.post('/videos/:id(\\d+)/segments/merge/confirm', (req, res, next) => {
+  try {
+    const videoId = Number(req.params.id);
+    const video = loadVideo(videoId);
+    const track = !!video.translation_lang;
+    const input = readMergeInput(req.body, { track });
+
+    const token = readPreviewToken(req.body && req.body.token);
+    if (!token || token.v !== videoId || token.m !== 'merge') {
+      throw new ApiError(409, 'preview_required',
+        '缺少有效的合并预览令牌：请先调用合并预览接口，再以预览返回的 token 确认');
+    }
+    const tokenPair = [token.a, token.b].sort((x, y) => x - y);
+    const reqPair = [input.firstId, input.secondId].sort((x, y) => x - y);
+    if (JSON.stringify(tokenPair) !== JSON.stringify(reqPair)) {
+      throw new ApiError(422, 'merge_pair_changed',
+        '确认的两段与预览不一致，请按预览时的两段确认，或重新预览；本次未写入任何内容');
+    }
+    const currentSegments = listSegments(video.id);
+    if (token.d !== draftFingerprint(currentSegments)) {
+      throw new ApiError(409, 'draft_changed',
+        '预览之后草稿已被修改（片段增删改或审校变化）。为避免覆盖更改，请重新预览后再确认；本次未写入任何内容',
+        { current_segments: currentSegments });
+    }
+
+    const result = applyMerge(video, input);
+    res.status(201).json({
+      ok: true,
+      kept_segment_id: result.earlierId,
+      removed_segment_id: result.laterId,
+      merged: result.merged,
+      segments: listSegments(video.id),
+      translations: track ? listTranslations(video.id) : [],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 一步直接合并（无需预览令牌）：字段同确认接口但省略 token；原子完成，失败零写入。
+router.post('/videos/:id(\\d+)/segments/merge', (req, res, next) => {
+  try {
+    const video = loadVideo(req.params.id);
+    const track = !!video.translation_lang;
+    const input = readMergeInput(req.body, { track });
+    const result = applyMerge(video, input);
+    res.status(201).json({
+      ok: true,
+      kept_segment_id: result.earlierId,
+      removed_segment_id: result.laterId,
+      merged: result.merged,
+      segments: listSegments(video.id),
+      translations: track ? listTranslations(video.id) : [],
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
 /* ---------------- 发布与导出 ---------------- */
 
 // 发布门禁：原文全部已审且时间合法；启用译文轨道时还要求每段译文齐备、

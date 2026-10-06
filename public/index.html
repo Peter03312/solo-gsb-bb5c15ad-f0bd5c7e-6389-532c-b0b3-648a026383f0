@@ -82,6 +82,62 @@
     </div>
   </div>
 
+  <!-- 相邻片段合并弹窗 -->
+  <div id="mergeModal" class="modal hidden">
+    <div class="modal-card wide">
+      <h3>合并相邻片段（两段合为一段）</h3>
+      <p class="meta">选择<b>时间端点相接</b>且<b>说话人归属相同</b>的两段：保留较早片段的 <b>ID、起点与归属</b>，终点取较晚片段，移除较晚片段；
+        保留段修订号 +1，合并后原文与译文均转<b>待审</b>；两段既有质检放行失效（历史理由保留可查），历史发布版本及其 SRT 不受影响。</p>
+      <div class="form-row">
+        <label>第一段
+          <select id="mergeFirst"></select>
+        </label>
+        <label>第二段
+          <select id="mergeSecond"></select>
+        </label>
+        <button type="button" class="btn small" id="mergeSwapBtn">⇄ 交换两段</button>
+      </div>
+      <p id="mergePairError" class="error"></p>
+
+      <div id="mergePreviewBox">
+        <div class="restore-compare">
+          <div>
+            <h4 id="mergeFirstTitle">第一段</h4>
+            <p class="meta" id="mergeFirstMeta"></p>
+            <pre id="mergeFirstText" class="tr-source"></pre>
+            <pre id="mergeFirstTr" class="tr-source"></pre>
+          </div>
+          <div>
+            <h4 id="mergeSecondTitle">第二段</h4>
+            <p class="meta" id="mergeSecondMeta"></p>
+            <pre id="mergeSecondText" class="tr-source"></pre>
+            <pre id="mergeSecondTr" class="tr-source"></pre>
+          </div>
+        </div>
+        <div id="mergeIssueBox" class="conflict-box hidden">
+          <b>⚠️ 这两段当前不能合并</b>
+          <ul id="mergeIssueList"></ul>
+        </div>
+        <p class="meta" id="mergeProposed"></p>
+      </div>
+
+      <label class="block">合并后原文（起点取较早段、终点取较晚段，非空）
+        <textarea id="mergeText" rows="4"></textarea>
+      </label>
+      <div id="mergeTrInputs" class="hidden">
+        <p class="meta">译文轨道（<b id="mergeTrLang"></b>）：须提交合并后<b>非空译文</b>，不能丢弃，也不能直接沿用任一旧译文，请按合并后原文重新翻译。</p>
+        <label class="block">合并后译文
+          <textarea id="mergeTr" rows="3" placeholder="按合并后原文重新翻译…"></textarea>
+        </label>
+      </div>
+      <p id="mergeError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="mergeCancel">取消（保留原稿）</button>
+        <button type="button" class="btn primary" id="mergeSave" disabled>确认合并</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 冲突弹窗 -->
   <div id="conflictModal" class="modal hidden">
     <div class="modal-card">
