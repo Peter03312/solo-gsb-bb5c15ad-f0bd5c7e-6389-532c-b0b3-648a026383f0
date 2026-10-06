@@ -51,6 +51,13 @@
   - 拆分原子完成：**原片段 ID 保留给左段且修订号 +1，右段获新 ID**（修订号从 1 开始）；两段原文及译文均转**待审**；
   - 既有质检放行随片段时间/文本变化**失效**（历史理由保留可查），质检规则按新时长重新计算；历史发布版本及其 SRT 不变，草稿、发布门禁与导出反映拆分结果；
   - 提交须携带所见原文修订号 `revision`（该片段已有译文时还须携带译文修订号 `translation_revision`），过期返回 `409` 与当前状态且零写入；非法切点、空文本或译文缺失同样零写入。
+- **相邻片段合并（端点相接两段合二为一，原子完成）**：把同一视频草稿中时间端点相接的两段字幕合并为一段：
+  - 提交两段 ID（顺序无关，服务端按时间确定较早段）、**各自所见原文修订号**与合并后**非空原文**；启用译文轨道时须同时提交合并后**非空译文**，并对两段**分别提交当前译文修订号**（无译文则显式传 `null` 标识缺失）——**不得直接沿用任一旧译文**，须按合并后原文重新翻译；
+  - 两段**说话人归属必须相同**（可以都未归属），否则拒绝；
+  - 合并原子完成：**保留较早片段的 ID、起点与说话人归属，终点取较晚片段**，较晚片段被移除，保留片段修订号 +1；合并后原文与译文均转**待审**；
+  - 两段既有质检放行随片段时间/文本变化**失效**（被移除段的放行历史转移到保留段名下，历史理由保留可查），质检规则按新时长重新计算；历史发布版本及其 SRT 不变，草稿列表、发布门禁与草稿 SRT 立即反映合并结果；
+  - 非相接、重复或缺失片段、跨视频、文本无效、任一修订号过期时**整次零写入**；修订号冲突返回 `409` 与**两段当前状态**（含译文）；
+  - 工作台片段表中与下一片段端点相接的行可点「合并」，在弹窗内查看拟合并结果（保留/移除的 ID、合并后时间范围与两段现状）并确认。
 - **质检（QC）阈值、逐段报告与单项放行**：
   - 每个视频可分别为**原文**与**已启用译文**轨道配置 `最大每秒字符数（CPS）` 与 `最大单行字符数` 两个阈值；阈值必须为正数（单行字符数为正整数，CPS 可为小数），留空/`null` 表示该项不检查；
   - **按 Unicode 码点计数**（emoji 等代理对算 1 个字符）；**换行不计入速度**，速度 = 非换行字符数 ÷ 片段时长（秒，`(end_ms-start_ms)/1000`）；单行字符数按换行切分后取最长行；
@@ -108,14 +115,14 @@ npm start
 
 同样访问 http://localhost:8080 。数据默认写入项目下 `./data/`。
 
-运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝，片段拆分的切点校验/双修订号/双段译文/复制禁止/放行失效/历史版本不可变，以及说话人名单 trim/去重/名单修订号/删除引用保护、片段归属修订号/转待审/译文不失效、未归属阻止发布与名称-归属快照不可变、拆分沿用与导入/恢复新片段未归属等 571 个断言）：
+运行端到端测试（覆盖校验、冲突、审校撤销、发布门禁、不可变版本、SRT 导入/冲突/整批原子写入、历史版本区间恢复、多片段整体平移的越界/重叠拒绝/译文失效/门禁联动、译文轨道双修订号/失效规则/双轨发布门禁与快照/译文 SRT 导出，质检阈值配置/码点计数/逐段报告/单项放行/失效锁存/发布阻断与版本快照/并发拒绝，片段拆分的切点校验/双修订号/双段译文/复制禁止/放行失效/历史版本不可变，说话人名单 trim/去重/名单修订号/删除引用保护、片段归属修订号/转待审/译文不失效、未归属阻止发布与名称-归属快照不可变、拆分沿用与导入/恢复新片段未归属，以及相邻片段合并的相接校验/双段修订号/说话人一致/译文缺失标识与复制禁止/放行失效保留/历史版本不可变等 637 个断言）：
 
 ```bash
 npm test
 ```
 
 测试分两部分：`test/migrate.test.js`（版本化升级流程，70 个断言）与
-`test/api.test.js`（业务与 HTTP API，571 个断言），`npm test` 会依次运行两者。
+`test/api.test.js`（业务与 HTTP API，637 个断言），`npm test` 会依次运行两者。
 
 ## 数据库升级（版本化迁移）
 
@@ -176,6 +183,9 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
    长字幕可点「拆分」：在严格位于起止之间的整数毫秒切点处一分为二，填写左右两段原文
    （启用译文轨道时还需按左右原文分别填写两段新译文，不能丢弃或复制原译文）；
    左段保留原片段 ID（修订号 +1），右段获新 ID，两段均转待审，既有质检放行失效（历史理由保留）。
+   与下一片段时间端点相接的行可点「合并」：弹窗内查看拟合并结果（保留较早片段的 ID/起点/归属、
+   终点取较晚片段、较晚片段移除），填写合并后原文（启用译文轨道时还需合并后译文，不得沿用任一旧译文）并确认；
+   两段说话人归属必须相同，合并后原文与译文均转待审，两段既有质检放行失效（历史理由保留）。
    需要整体校准时间时，勾选若干片段（表头复选框可全选）后点「⇄ 整体平移…」：
    填写非零整数毫秒偏移（正数延后、负数提前）并「预览平移」，逐段核对调整前后时间、越界与未选片段冲突，
    确认无误后「确认一次性应用」；所选片段相对间距不变、修订号逐段 +1 并撤销原文审校，其译文会标记「已失效」需重新校对。
@@ -203,7 +213,8 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 
 所有写操作的 JSON 请求体均需携带整数修订号 `revision`（新增片段除外；区间恢复确认、多片段整体平移确认改持预览令牌 `token`；
 译文写操作需同时携带所见原文修订号 `segment_revision`，首次录入译文无需译文 `revision`；片段拆分在已有译文时还须携带
-所见译文修订号 `translation_revision`）。
+所见译文修订号 `translation_revision`；相邻片段合并携带两段各自所见修订号 `first_revision`/`second_revision`，
+启用译文轨道时另需两段译文修订号 `first_translation_revision`/`second_translation_revision`（无译文则显式传 `null`））。
 质检规则修改携带所见规则修订号 `rules_revision`（首次配置传 `0`）；质检放行携带 `segment_revision`，
 译文放行还需译文 `revision`；**说话人名单增删改携带所见名单修订号 `list_revision`（首次传 `0`），片段归属修改携带
 所见片段修订号 `revision`**；过期一律 `409 revision_conflict` 并返回当前状态。
@@ -217,6 +228,7 @@ Compose 中改宿主机端口示例（宿主 9000 → 容器 8080）：
 | `POST` | `/api/videos/:id/segments` | 新增片段 `{start_ms,end_ms,text}` |
 | `PUT` | `/api/videos/:id/segments/:sid` | 修改 `{start_ms,end_ms,text,revision}` |
 | `POST` | `/api/videos/:id/segments/:sid/split` | 拆分片段 `{cut_ms,left_text,right_text,revision[,left_translation,right_translation,translation_revision]}`，原子拆为左右两段 |
+| `POST` | `/api/videos/:id/segments/merge` | 合并相邻片段 `{first_id,second_id,first_revision,second_revision,text[,translation,first_translation_revision,second_translation_revision]}`，原子合为一段 |
 | `DELETE` | `/api/videos/:id/segments/:sid` | 删除（JSON 体带 `revision`） |
 | `POST` | `/api/videos/:id/segments/:sid/review` | 审校切换 `{reviewed,revision}` |
 | `GET` | `/api/videos/:id/speakers` | 说话人名单（含每个说话人 `usage_count`）与未归属片段 `unassigned_segment_ids`、`list_revision` |
@@ -495,6 +507,64 @@ curl -s -X POST http://localhost:8080/api/videos/$V/segments/7/split \
 | `422 missing_translation` | 已启用译文轨道但缺少左/右译文，或译文为空白 |
 | `422 copied_translation` | 左/右译文与原译文完全相同，须按拆分后的原文重新翻译 |
 | `422 invalid_timeline` | 拆分后时间线不合法（防御性复算），未写入 |
+
+### 相邻片段合并调用示例（一步原子完成）
+
+把端点相接的片段 #7（1000–2000ms，所见修订号 3）与 #8（2000–3000ms，所见修订号 1）合并为一段：
+保留较早片段 #7 的 ID、起点与说话人归属，终点取 #8 的终点，#8 被移除；#7 修订号 +1，
+合并后原文与译文均转待审，两段既有质检放行失效（历史理由保留可查），
+历史发布版本及其 SRT 不变，草稿、发布门禁与导出立即反映合并结果。
+两段 ID 顺序无关（服务端按时间确定较早段），但修订号始终与提交的 ID 配对。
+
+```bash
+V=12
+
+# 未启用译文轨道：提交两段 ID + 各自所见修订号 + 合并后非空原文
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"first_id":7,"second_id":8,"first_revision":3,"second_revision":1,"text":"两句合成一句"}'
+```
+
+成功返回 `201`（节选）：
+
+```json
+{
+  "ok": true,
+  "merged": { "id": 7, "start_ms": 1000, "end_ms": 3000, "text": "两句合成一句", "reviewed": false, "revision": 4 },
+  "removed_id": 8,
+  "segments": [ /* 合并后的完整草稿片段列表 */ ],
+  "translations": []
+}
+```
+
+启用译文轨道时，须同时提交合并后**非空译文** `translation`，并对两段分别提交当前译文修订号
+（`first_translation_revision`/`second_translation_revision`，与提交的 ID 配对）；该段无译文时显式传 `null`。
+合并译文不得与任一旧译文完全相同（不得丢弃或直接沿用旧译文，须按合并后原文重新翻译）；
+保留段已有译文时合并译文在其译文行上更新（修订号 +1），否则新建（修订号从 1 开始），均待审且绑定合并后原文：
+
+```bash
+# #7 有译文（rev 2），#8 无译文（显式 null）
+curl -s -X POST http://localhost:8080/api/videos/$V/segments/merge \
+  -H 'Content-Type: application/json' \
+  -d '{"first_id":7,"second_id":8,"first_revision":3,"second_revision":1,"text":"两句合成一句",
+       "translation":"Two sentences merged into one","first_translation_revision":2,"second_translation_revision":null}'
+```
+
+失败约定（均零写入，草稿保持原样）：
+
+| 状态 / code | 含义 |
+| --- | --- |
+| `422 invalid_segment_ids` / `422 duplicate_segments` | 片段 ID 缺失或不是正整数；两段 ID 相同 |
+| `404 segment_not_found` | 任一片段不存在于该视频（跨视频 ID 同样按不存在处理） |
+| `422 missing_revision` | 缺少所见原文修订号；或译文轨道下缺少译文修订号标识（有译文给修订号、无译文传 `null`） |
+| `409 revision_conflict` | 任一原文或译文修订号过期；`error.current` 为 `{first, second}` 两段当前状态（各含 `segment` 与 `translation`） |
+| `422 not_adjacent` | 两段时间端点不相接（较早段终点 ≠ 较晚段起点），无法合并 |
+| `422 speaker_mismatch` | 两段说话人归属不同，须先归属到同一说话人（或都置为未归属） |
+| `422 empty_text` | 合并后原文为空（去首尾空白后至少 1 个字符） |
+| `422 missing_translation` | 已启用译文轨道但缺少合并译文，或译文为空白 |
+| `422 translation_not_found` | 某段没有译文却提交了译文修订号（应显式传 `null`） |
+| `422 copied_translation` | 合并译文与任一旧译文完全相同，须按合并后原文重新翻译 |
+| `422 invalid_timeline` | 合并后时间线不合法（防御性复算），未写入 |
 
 ### 译文轨道调用示例
 

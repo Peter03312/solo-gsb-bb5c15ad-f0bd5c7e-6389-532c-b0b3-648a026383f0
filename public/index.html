@@ -82,6 +82,47 @@
     </div>
   </div>
 
+  <!-- 合并相邻片段弹窗 -->
+  <div id="mergeModal" class="modal hidden">
+    <div class="modal-card">
+      <h3>合并相邻片段（两段合二为一）</h3>
+      <p class="meta">保留较早片段 #<span id="mergeKeepId"></span> 的 ID、起点与说话人归属，终点取较晚片段 #<span id="mergeRemoveId"></span>
+        的终点，较晚片段将被移除；保留片段修订号 +1，合并后原文与译文均转<b>待审</b>；
+        两段既有质检放行失效（历史理由保留），历史发布版本及其 SRT 不受影响。</p>
+      <p class="meta">所见修订号：#<span id="mergeKeepId2"></span> rev <b id="mergeFirstRev"></b> ｜
+        #<span id="mergeRemoveId2"></span> rev <b id="mergeSecondRev"></b><span id="mergeTrRevWrap" class="hidden">
+        ｜ 译文修订号 <b id="mergeTrRevs"></b></span></p>
+      <div class="restore-compare">
+        <div>
+          <h4>较早片段（保留 ID 与归属）</h4>
+          <pre id="mergeFirstSource" class="tr-source"></pre>
+          <pre id="mergeFirstTr" class="tr-source hidden"></pre>
+        </div>
+        <div>
+          <h4>较晚片段（合并后移除）</h4>
+          <pre id="mergeSecondSource" class="tr-source"></pre>
+          <pre id="mergeSecondTr" class="tr-source hidden"></pre>
+        </div>
+      </div>
+      <p class="meta">拟合并结果：时间 <b id="mergeRange"></b>，保留 #<span id="mergeKeepId3"></span>（修订号 +1），两段均须说话人归属相同。</p>
+      <p id="mergeSpeakerWarn" class="warn hidden">⚠️ 两段说话人归属不同，不能合并：请先把两段归属到同一说话人（或都置为未归属）。</p>
+      <label class="block">合并后原文（非空）
+        <textarea id="mergeText" rows="3"></textarea>
+      </label>
+      <div id="mergeTrInputs" class="hidden">
+        <p class="meta">译文轨道（<b id="mergeTrLang"></b>）：须提交合并后<b>非空译文</b>，不得直接沿用任一旧译文。</p>
+        <label class="block">合并后译文
+          <textarea id="mergeTr" rows="3" placeholder="按合并后原文重新翻译…"></textarea>
+        </label>
+      </div>
+      <p id="mergeError" class="error"></p>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" id="mergeCancel">取消（保留原稿）</button>
+        <button type="button" class="btn primary" id="mergeSave">确认合并</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 冲突弹窗 -->
   <div id="conflictModal" class="modal hidden">
     <div class="modal-card">

@@ -235,6 +235,7 @@ function anyModalOpen() {
   return !$('editorModal').classList.contains('hidden') ||
          !$('conflictModal').classList.contains('hidden') ||
          !$('splitModal').classList.contains('hidden') ||
+         !$('mergeModal').classList.contains('hidden') ||
          !$('importModal').classList.contains('hidden') ||
          !$('restoreModal').classList.contains('hidden') ||
          !$('shiftModal').classList.contains('hidden') ||
@@ -463,9 +464,12 @@ function renderSegmentTable() {
       renderSegmentTable();
     });
   }
-  tbody.innerHTML = state.segments.map((s) => {
+  tbody.innerHTML = state.segments.map((s, idx) => {
     const checked = state.shiftSelected.has(s.id);
     const tr = track ? trOf(s.id) : null;
+    // 与下一片段时间端点相接才能合并（合并弹窗内查看拟合并结果并确认）
+    const nextSeg = idx + 1 < state.segments.length ? state.segments[idx + 1] : null;
+    const canMerge = !!(nextSeg && nextSeg.start_ms === s.end_ms);
     const trCell = track ? `
       <td class="seg-text-cell">${tr ? (esc(tr.text) || '<span class="meta">(空)</span>') : '<span class="meta">—</span>'}
           <div style="margin-top:3px">${trStatusTag(tr)}${tr ? `<span class="mono">rev ${tr.revision}</span>` : ''}</div></td>` : '';
@@ -494,6 +498,7 @@ function renderSegmentTable() {
         <button class="btn small" data-act="seek">定位</button>
         <button class="btn small" data-act="edit">编辑</button>
         <button class="btn small" data-act="split">拆分</button>
+        <button class="btn small" data-act="merge" ${canMerge ? '' : 'disabled title="与下一片段时间端点不相接，不能合并"'}>合并</button>
         <button class="btn small ${s.reviewed ? 'ghost' : 'ok'}" data-act="review">${s.reviewed ? '取消审校' : '标记已审'}</button>
         ${trActions}
         <button class="btn small danger" data-act="del">删除</button>
@@ -518,6 +523,7 @@ function renderSegmentTable() {
     });
     tr.querySelector('[data-act=edit]').addEventListener('click', () => openEditor('edit', seg));
     tr.querySelector('[data-act=split]').addEventListener('click', () => openSplitModal(seg));
+    tr.querySelector('[data-act=merge]').addEventListener('click', () => openMergeModal(seg));
     tr.querySelector('[data-act=review]').addEventListener('click', () => toggleReview(seg));
     tr.querySelector('[data-act=del]').addEventListener('click', () => deleteSegment(seg));
     const trEditBtn = tr.querySelector('[data-act=tr-edit]');
@@ -897,6 +903,114 @@ async function saveSplit() {
     }
     // 422 等非法修改：保留弹窗与用户输入（原稿未被服务端改动）
     $('splitError').textContent = `未拆分：${err.message}`;
+  }
+}
+
+/* ================= 相邻片段合并弹窗 ================= */
+const mergeEditor = { firstId: null, secondId: null };
+
+// 打开合并弹窗：seg 为较早片段，与其时间端点相接的下一片段合并（服务端按时间确定较早段，与提交顺序无关）
+function openMergeModal(seg) {
+  const idx = state.segments.findIndex((s) => s.id === seg.id);
+  const next = idx >= 0 && idx + 1 < state.segments.length ? state.segments[idx + 1] : null;
+  if (!next || next.start_ms !== seg.end_ms) return;
+  mergeEditor.firstId = seg.id;
+  mergeEditor.secondId = next.id;
+  fillMergeModal(seg, next, false);
+  $('mergeError').textContent = '';
+  $('mergeModal').classList.remove('hidden');
+}
+
+// 填充弹窗只读部分（当前两段原文/译文、修订号、拟合并结果）；keepInputs 保留用户已输入的合并文本
+function fillMergeModal(first, second, keepInputs) {
+  const track = !!state.translationLang;
+  const trA = track ? trOf(first.id) : null;
+  const trB = track ? trOf(second.id) : null;
+  ['mergeKeepId', 'mergeKeepId2', 'mergeKeepId3'].forEach((id) => { $(id).textContent = first.id; });
+  ['mergeRemoveId', 'mergeRemoveId2'].forEach((id) => { $(id).textContent = second.id; });
+  $('mergeFirstRev').textContent = first.revision;
+  $('mergeSecondRev').textContent = second.revision;
+  $('mergeFirstSource').textContent = `#${first.id}（${fmtTime(first.start_ms)} → ${fmtTime(first.end_ms)}）\n${first.text || '(空文本)'}`;
+  $('mergeSecondSource').textContent = `#${second.id}（${fmtTime(second.start_ms)} → ${fmtTime(second.end_ms)}）\n${second.text || '(空文本)'}`;
+  $('mergeRange').textContent = `${fmtTime(first.start_ms)} → ${fmtTime(second.end_ms)}`;
+  // 两段说话人归属必须相同，否则不能合并（服务端同样拒绝）
+  const sameSpeaker = (first.speaker_id == null ? null : first.speaker_id) ===
+    (second.speaker_id == null ? null : second.speaker_id);
+  $('mergeSpeakerWarn').classList.toggle('hidden', sameSpeaker);
+  $('mergeSave').disabled = !sameSpeaker;
+  $('mergeTrRevWrap').classList.toggle('hidden', !track);
+  $('mergeTrInputs').classList.toggle('hidden', !track);
+  if (track) {
+    $('mergeTrRevs').textContent =
+      `#${first.id} ${trA ? `rev ${trA.revision}` : '无译文（提交 null）'} ｜ ` +
+      `#${second.id} ${trB ? `rev ${trB.revision}` : '无译文（提交 null）'}`;
+    $('mergeTrLang').textContent = state.translationLang;
+    $('mergeFirstTr').classList.toggle('hidden', !trA);
+    if (trA) $('mergeFirstTr').textContent = `译文：${trA.text || '(空)'}`;
+    $('mergeSecondTr').classList.toggle('hidden', !trB);
+    if (trB) $('mergeSecondTr').textContent = `译文：${trB.text || '(空)'}`;
+  } else {
+    $('mergeFirstTr').classList.add('hidden');
+    $('mergeSecondTr').classList.add('hidden');
+  }
+  if (!keepInputs) {
+    // 预填两段原文的拼接便于修改；译文留空（不得直接沿用任一旧译文）
+    $('mergeText').value = first.text + second.text;
+    $('mergeTr').value = '';
+  }
+}
+
+function closeMergeModal() {
+  mergeEditor.firstId = null;
+  mergeEditor.secondId = null;
+  $('mergeModal').classList.add('hidden');
+}
+
+async function saveMerge() {
+  const first = state.segments.find((s) => s.id === mergeEditor.firstId);
+  const second = state.segments.find((s) => s.id === mergeEditor.secondId);
+  if (!first || !second) { closeMergeModal(); return; }
+  const body = {
+    first_id: first.id,
+    second_id: second.id,
+    first_revision: first.revision,
+    second_revision: second.revision,
+    text: $('mergeText').value,
+  };
+  if (state.translationLang) {
+    body.translation = $('mergeTr').value;
+    const trA = trOf(first.id);
+    const trB = trOf(second.id);
+    body.first_translation_revision = trA ? trA.revision : null;
+    body.second_translation_revision = trB ? trB.revision : null;
+  }
+  $('mergeError').textContent = '';
+  try {
+    const data = await api(`/api/videos/${state.video.id}/segments/merge`, { method: 'POST', body });
+    state.segments = data.segments;
+    state.translations = data.translations || [];
+    closeMergeModal();
+    renderSegmentDependent();
+    // 合并改变时长并使放行失效：立即刷新质检报告与发布门禁
+    loadQcReport().then(() => { renderQcPanel(); renderPublishCard(); }).catch(() => {});
+    toast(`已合并为 #${data.merged.id}（${fmtTime(data.merged.start_ms)} → ${fmtTime(data.merged.end_ms)}），原文与译文均待审`);
+  } catch (err) {
+    if (err.status === 409) {
+      // 修订号过期：刷新为当前两段状态，保留用户已输入的合并文本
+      await refreshCurrent();
+      const fa = state.segments.find((s) => s.id === mergeEditor.firstId);
+      const fb = state.segments.find((s) => s.id === mergeEditor.secondId);
+      if (!fa || !fb) {
+        closeMergeModal();
+        toast('冲突：相关片段已被他人修改或删除，已刷新列表', true);
+        return;
+      }
+      fillMergeModal(fa, fb, true);
+      $('mergeError').textContent = `未合并：${err.message}`;
+      return;
+    }
+    // 422 等非法修改：保留弹窗与用户输入（原稿未被服务端改动）
+    $('mergeError').textContent = `未合并：${err.message}`;
   }
 }
 
@@ -1931,6 +2045,9 @@ $('splitCancel').addEventListener('click', closeSplitModal);
 $('splitSave').addEventListener('click', saveSplit);
 $('splitCutNow').addEventListener('click', () => { $('splitCut').value = currentMs(); });
 $('splitModal').addEventListener('click', (e) => { if (e.target === $('splitModal')) closeSplitModal(); });
+$('mergeCancel').addEventListener('click', closeMergeModal);
+$('mergeSave').addEventListener('click', saveMerge);
+$('mergeModal').addEventListener('click', (e) => { if (e.target === $('mergeModal')) closeMergeModal(); });
 $('importCancel').addEventListener('click', closeImportModal);
 $('importPreviewBtn').addEventListener('click', previewImport);
 $('importAppendBtn').addEventListener('click', () => confirmImport('append'));
